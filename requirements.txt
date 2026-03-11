@@ -1,3 +1,12 @@
-numpy~=2.2.6
-scipy~=1.16.3
-scikit-image~=0.25.2
+numpy
+scipy
+scikit-image
+openai
+imagecodecs
+requests
+ultralytics
+segment_anything
+pillow
+transformers
+git+https://github.com/JPEG-Trust-Community/watermarking.git#subdirectory=evaluation_metric/package
+simple_lama_inpainting

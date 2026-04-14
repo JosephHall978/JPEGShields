@@ -2,7 +2,7 @@
 
 > **JPEG Trust Watermarking | ICIP 2026 Grand Challenge**
 
-![JPeG Shields Logo](logo__1_.png)
+![JPeG Shields Logo](logo.png)
 
 JPeG Shields is a frequency-domain image watermarking system developed for the **JPEG Trust Watermarking Grand Challenge at ICIP 2026**. The system embeds imperceptible binary watermarks into images using the Discrete Fourier Transform (DFT) and evaluates their robustness against a comprehensive suite of image attacks.
 

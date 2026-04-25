@@ -1,7 +1,12 @@
 import numpy as np
 from scipy.fft import fft2, ifft2, fftshift, ifftshift
+from scipy.linalg import sqrtm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from skimage.color import rgb2ycbcr
+import torch
+import torchvision.transforms as transforms
+from torchvision.models import inception_v3
+from PIL import Image
 
 class HammingECC:
     _P = np.array([
@@ -25,8 +30,8 @@ class HammingECC:
         pad = (-len(bits)) % cls.K
         bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
         chunks = bits.reshape(-1, cls.K)
-        parity = (chunks @ cls._P) % 2          # (n_chunks, 4)
-        codewords = np.concatenate([chunks, parity], axis=1)  # (n_chunks, 15)
+        parity = (chunks @ cls._P) % 2
+        codewords = np.concatenate([chunks, parity], axis=1)
         return codewords.flatten(), pad
 
     @classmethod
@@ -36,7 +41,7 @@ class HammingECC:
         codewords = bits[: n_words * cls.N].reshape(n_words, cls.N)
         decoded = []
         for cw in codewords:
-            syndrome = (cls._H @ cw) % 2          # shape (4,)
+            syndrome = (cls._H @ cw) % 2
             err_pos  = int(''.join(syndrome[::-1].astype(str)), 2) - 1
             if 0 <= err_pos < cls.N:
                 cw = cw.copy()
@@ -45,12 +50,57 @@ class HammingECC:
         result = np.concatenate(decoded)
         return result[:len(result) - pad] if pad else result
 
+
+class InceptionFeatureExtractor:
+    def __init__(self, device: str = None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = inception_v3(weights="DEFAULT")
+        model.fc = torch.nn.Identity()
+        model.eval()
+        self.model = model.to(self.device)
+
+        self.transform = transforms.Compose([
+            transforms.Resize((299, 299)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+
+    @torch.no_grad()
+    def get_features(self, images: list[np.ndarray]) -> np.ndarray:
+        tensors = []
+        for img in images:
+            pil = Image.fromarray(img.astype(np.uint8))
+            tensors.append(self.transform(pil))
+        batch = torch.stack(tensors).to(self.device)
+        feats = self.model(batch)
+        return feats.cpu().numpy()
+
+
+def _frechet_distance(mu1, sigma1, mu2, sigma2, eps = 1e-6):
+    diff = mu1 - mu2
+    # Regularise to avoid singular covariance matrices
+    sigma1 += np.eye(sigma1.shape[0]) * eps
+    sigma2 += np.eye(sigma2.shape[0]) * eps
+
+    covmean, _ = sqrtm(sigma1 @ sigma2, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    fid = (diff @ diff
+           + np.trace(sigma1)
+           + np.trace(sigma2)
+           - 2.0 * np.trace(covmean))
+    return float(np.real(fid))
+
+
 class WaterMarker:
     def __init__(self):
         self.seq_len   = 100
         self.alpha     = 0.75
         self.block_dim = 4
         self.repeats   = 3
+        self._inception = None
 
     def _encode_payload(self, watermark: np.ndarray):
         wm = np.array(watermark, dtype=np.uint8)
@@ -97,8 +147,13 @@ class WaterMarker:
         if len(S) < 2 or S[1] < 1e-10:
             return 0.5
         ratio = S[0] / S[1]
-        mid   = 1 + alpha * 4.5          # midpoint between bit-0 and bit-1 levels
+        mid   = 1 + alpha * 4.5
         return 1.0 if ratio > mid else 0.0
+
+    def _get_inception(self):
+        if self._inception is None:
+            self._inception = InceptionFeatureExtractor()
+        return self._inception
 
     def generate(self, image: np.ndarray, watermark: np.ndarray) -> np.ndarray:
         work   = image.astype(np.float64)
@@ -115,10 +170,10 @@ class WaterMarker:
 
             bd = self.block_dim
             for bit_idx, (r0, c0) in enumerate(blocks):
-                blk          = mag[r0:r0+bd, c0:c0+bd].copy()
+                blk = mag[r0:r0+bd, c0:c0+bd].copy()
                 mag[r0:r0+bd, c0:c0+bd] = self._embed_bit_svd(blk, bits[bit_idx], self.alpha)
 
-            new_dft = ifftshift(mag * np.exp(1j * phase))
+            new_dft    = ifftshift(mag * np.exp(1j * phase))
             channel_wm = np.real(ifft2(new_dft))
             watermarked_layers.append(channel_wm)
 
@@ -142,7 +197,6 @@ class WaterMarker:
                 soft.append(self._read_bit_svd(blk, self.alpha))
             channel_bits.append(soft)
 
-        # Average soft decisions across channels, then hard-decide
         avg  = np.mean(np.array(channel_bits), axis=0)
         hard = (avg > 0.5).astype(np.uint8)
         return self._decode_payload(hard)
@@ -165,15 +219,35 @@ class WaterMarker:
         y_wm   = rgb2ycbcr(watermarked)[..., 0].astype(np.float64)
         return np.mean(np.abs(y_orig - y_wm))
 
+    def compute_fid(self,orig_images,watermarked_images):
+        extractor = self._get_inception()
+
+        feats_orig = extractor.get_features(orig_images)
+        feats_wm = extractor.get_features(watermarked_images)
+
+        mu1, sigma1 = feats_orig.mean(axis=0), np.cov(feats_orig, rowvar=False)
+        mu2, sigma2 = feats_wm.mean(axis=0),   np.cov(feats_wm,   rowvar=False)
+
+        if sigma1.ndim == 0:
+            sigma1 = sigma1.reshape(1, 1)
+        if sigma2.ndim == 0:
+            sigma2 = sigma2.reshape(1, 1)
+
+        return _frechet_distance(mu1, sigma1, mu2, sigma2)
+
     def evaluate(self, image, original_watermark):
         recovered = self.recover(image)
         n = min(len(original_watermark), len(recovered))
         return int(np.sum(original_watermark[:n] != recovered[:n]))
 
-    def evaluate_watermarking(self, original_img, watermarked_img):
+    def evaluate_watermarking(self,original_img,watermarked_img,orig_dataset=None,watermarked_dataset=None):
+        orig_set = orig_dataset or [original_img]
+        wm_set   = watermarked_dataset or [watermarked_img]
+
         return {
-            "PSNR":  self.compute_psnr(original_img, watermarked_img),
+            "PSNR": self.compute_psnr(original_img, watermarked_img),
             "wPSNR": self.compute_wpsnr(original_img, watermarked_img),
-            "SSIM":  self.compute_ssim(original_img, watermarked_img),
-            "JND":   self.compute_jnd(original_img, watermarked_img),
+            "SSIM": self.compute_ssim(original_img, watermarked_img),
+            "JND": self.compute_jnd(original_img, watermarked_img),
+            "FID": self.compute_fid(orig_set, wm_set),
         }

@@ -77,15 +77,13 @@ class InceptionFeatureExtractor:
         return feats.cpu().numpy()
 
 
-def _frechet_distance(mu1, sigma1, mu2, sigma2, eps = 1e-6):
+def _frechet_distance(mu1, sigma1, mu2, sigma2):
     diff = mu1 - mu2
-    # Regularise to avoid singular covariance matrices
     sigma1 += np.eye(sigma1.shape[0]) * eps
     sigma2 += np.eye(sigma2.shape[0]) * eps
 
-    covmean, _ = sqrtm(sigma1 @ sigma2, disp=False)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
+    sqrtm_result = sqrtm(sigma1 @ sigma2)
+    covmean = sqrtm_result.real if np.iscomplexobj(sqrtm_result) else sqrtm_result
 
     fid = (diff @ diff
            + np.trace(sigma1)
